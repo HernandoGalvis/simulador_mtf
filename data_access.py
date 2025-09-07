@@ -1,6 +1,10 @@
 # simulator/data_access.py
 # Acceso a datos: señales y precios desde tablas reales (casteo a float de numerics)
-# v1.3.0
+# v1.3.1
+#
+# Cambios v1.3.1:
+# - SignalProviderDB.get_signals_by_minute ahora selecciona mult_sl_asignado y mult_tp_asignado.
+# - SignalRecord mapea y expone mult_sl_asignado y mult_tp_asignado (float|None).
 #
 # Cambios v1.3.0:
 # - Persistencia de conexión a PostgreSQL en SignalProviderDB y PriceProviderDB (una conexión por proveedor).
@@ -31,6 +35,7 @@ class SignalRecord:
     """
     Representa una señal cruda proveniente de senales_generadas.
     Los campos target_profit_price, stop_loss_price, precio_senal se castean a float.
+    Los multiplicadores mult_sl_asignado, mult_tp_asignado se exponen como float|None.
     """
     def __init__(self, row):
         (self.id_senal,
@@ -41,11 +46,16 @@ class SignalRecord:
          target_profit_price,
          stop_loss_price,
          apalancamiento_calculado,
-         precio_senal) = row
+         precio_senal,
+         mult_sl_asignado,
+         mult_tp_asignado) = row
         self.target_profit_price = _to_float(target_profit_price)
         self.stop_loss_price = _to_float(stop_loss_price)
         self.apalancamiento_calculado = int(apalancamiento_calculado) if apalancamiento_calculado is not None else 1
         self.precio_senal = _to_float(precio_senal)
+        # Multiplicadores: mantener None si vienen NULL para que el Core valide correctamente
+        self.mult_sl_asignado = float(mult_sl_asignado) if mult_sl_asignado is not None else None
+        self.mult_tp_asignado = float(mult_tp_asignado) if mult_tp_asignado is not None else None
 
 class PriceRecord:
     """
@@ -105,7 +115,7 @@ class SignalProviderDB:
         # Autocommit False: SELECT no requiere commit; en caso de error hacemos rollback.
         self.conn.autocommit = False
         self.query_count = 0
-        self.strategy_loader: StrategyLoader | None = None  # asignada externamente
+        self.strategy_loader: Optional["StrategyLoader"] = None  # asignada externamente
 
     def _ensure_conn(self):
         if self.conn is None or getattr(self.conn, "closed", 0):
@@ -123,7 +133,9 @@ class SignalProviderDB:
                target_profit_price,
                stop_loss_price,
                apalancamiento_calculado,
-               precio_senal
+               precio_senal,
+               mult_sl_asignado,
+               mult_tp_asignado
           FROM senales_generadas
          WHERE timestamp_senal = %s
         """
