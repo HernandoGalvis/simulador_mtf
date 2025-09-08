@@ -1,6 +1,11 @@
 # simulator/persistence.py
 # Adaptador de persistencia a PostgreSQL
-# v1.4.0
+# v1.4.1
+#
+# Cambios v1.4.1:
+# - Normaliza todos los timestamps que se escriben en columnas "timestamp" (sin zona) a UTC "naive".
+#   * Deja de enviar datetimes con tzinfo=UTC a columnas sin zona (evita corrimiento visual de horas).
+#   * Aplica a: timestamp_apertura, timestamp_cierre y timestamp_evento (logs).
 #
 # Cambios v1.4.0:
 # - INSERT de operaciones ahora persiste mult_sl_asignado y mult_tp_asignado (desde Operation).
@@ -15,16 +20,28 @@ from typing import Dict, Any, Optional, Callable, Tuple
 from simulator.models import Operation, Investor
 import psycopg2.extras
 
+
 def default_ts_to_datetime(base_dt: datetime, ts_minute: int) -> datetime:
-    return (base_dt + timedelta(minutes=ts_minute)).replace(tzinfo=timezone.utc)
+    """
+    Convierte un offset de minutos a un datetime "naive" en UTC, partiendo de base_dt (que se maneja como UTC).
+    No agrega tzinfo para mantener compatibilidad con columnas timestamp (sin zona) en la BD.
+    """
+    return (base_dt + timedelta(minutes=ts_minute))
+
 
 class PersistenceAdapter:
     def __init__(self, dsn: str, base_datetime: datetime,
                  ts_to_datetime_fn: Optional[Callable[[int], datetime]] = None,
-                 error_callback: Optional[Callable[[Exception,str], None]] = None):
+                 error_callback: Optional[Callable[[Exception, str], None]] = None):
         self.conn = psycopg2.connect(dsn)
         self.conn.autocommit = False
-        self.base_datetime = base_datetime.replace(tzinfo=timezone.utc)
+
+        # Asegurar que base_datetime se maneje como UTC "naive" (sin tzinfo),
+        # ya que las columnas destino son timestamp (sin zona).
+        if base_datetime.tzinfo is not None:
+            base_datetime = base_datetime.astimezone(timezone.utc).replace(tzinfo=None)
+        self.base_datetime = base_datetime
+
         self.ts_to_datetime_fn = ts_to_datetime_fn or (lambda ts: default_ts_to_datetime(self.base_datetime, ts))
         self.error_callback = error_callback
 
@@ -35,11 +52,19 @@ class PersistenceAdapter:
             pass
 
     def _dt(self, ts: Optional[int]) -> Optional[datetime]:
+        """
+        Convierte un ts (minuto relativo) a datetime "naive" en UTC,
+        apto para columnas timestamp (sin zona).
+        """
         if ts is None:
             return None
-        return self.ts_to_datetime_fn(ts)
+        dt = self.ts_to_datetime_fn(ts)
+        # Normalizar a naive UTC por si la función personalizada retorna tz-aware.
+        if isinstance(dt, datetime) and dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
 
-    def _exec(self, sql: str, params: dict, fetch: bool=False):
+    def _exec(self, sql: str, params: dict, fetch: bool = False):
         try:
             with self.conn.cursor() as cur:
                 cur.execute(sql, params)
@@ -296,11 +321,18 @@ class PersistenceAdapter:
         );
         """
         from psycopg2.extras import Json
+
+        # Normalizar timestamp_evento a UTC naive (para columna timestamp sin zona)
+        ts_evento = evento.get("ts_evento") or datetime.now(timezone.utc)
+        if isinstance(ts_evento, datetime) and ts_evento.tzinfo is not None:
+            ts_evento = ts_evento.astimezone(timezone.utc).replace(tzinfo=None)
+
         detalle_crudo = evento.get("detalle_json")
         if detalle_crudo is None:
             detalle_crudo = evento.get("detalle", {})
+
         params = dict(
-            ts_evento=evento.get("ts_evento") or datetime.now(timezone.utc),
+            ts_evento=ts_evento,
             id_inv=investor.id_inversionista,
             id_senal_fk=evento.get("id_senal_fk"),
             id_op=evento.get("id_op"),
