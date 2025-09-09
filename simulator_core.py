@@ -36,6 +36,20 @@ from simulator.closures import evaluar_cierres_reglas
 from simulator.finalization import finalizar_simulacion
 from simulator.utils_time import minute_to_datetime
 
+# --- DEBUG LOGGER para seguimiento exhaustivo ---
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler("simulador_debug.log"),
+        logging.StreamHandler()
+    ]
+)
+def log_debug(msg: str):
+    logging.info(msg)
+# ------------------------------------------------
+
 class SimulatorCore:
     def __init__(
         self,
@@ -133,6 +147,12 @@ class SimulatorCore:
                         detalle=detalle)
 
     def _abrir_operacion(self, s, price_record, ts: int):
+        # -------- LOG 1: Señal leída --------
+        log_debug(f"[SEÑAL] id_senal={s.id_senal} precio_senal={getattr(s, 'precio_senal', None)} timestamp_leido={getattr(s, 'timestamp_senal', None)}")
+
+        # -------- LOG 2: Vela de 1m usada --------
+        log_debug(f"[VELA_1M] id_vela_1m={getattr(price_record, 'id_vela', None)} close={getattr(price_record, 'close', None)} timestamp_1m={getattr(price_record, 'timestamp', None)}")
+
         # Validaciones previas de estado/inversor
         if self.investor.drawdown_activo or self.investor.halted:
             self._rechazo_apertura(s, "investor_halted_drawdown", {
@@ -171,11 +191,15 @@ class SimulatorCore:
             }, ts=ts)
             return
 
-        # Precio ejecución = close de la vela 1m
+        # -------- LOG 3: Precio asignado a la variable de apertura --------
         precio_exec = price_record.close
+        log_debug(f"[ASIGNACION PRECIO_EXEC] id_senal={s.id_senal} precio_exec={precio_exec} (close 1m)")
+
         cantidad = (monto * apalancamiento) / max(precio_exec, 1e-12)
         comision = calcular_comision(precio_exec, cantidad, self.investor.commission_pct)
         total_debitar = monto + comision
+        log_debug(f"[CANTIDAD/MONTO] id_senal={s.id_senal} cantidad={cantidad} monto={monto} apalancamiento={apalancamiento} comision={comision} total_debitar={total_debitar}")
+
         if not validar_capital_disponible(self.investor, total_debitar):
             self._rechazo_apertura(s, "capital_insuficiente", {
                 "capital_actual": self.investor.capital_actual,
@@ -217,6 +241,9 @@ class SimulatorCore:
         setattr(op, "mult_tp_asignado", getattr(s, "mult_tp_asignado", None))
         op.init_extremos()
 
+        # -------- LOG 4: Valor de precio_apertura antes de grabar la operación --------
+        log_debug(f"[PRE-GRABADO] id_senal={s.id_senal} id_inversionista={self.investor.id_inversionista} precio_apertura_asignado={op.precio_entrada}")
+
         capital_antes = self.investor.capital_actual
         try:
             new_id = self.persistence.insert_operacion(
@@ -235,6 +262,7 @@ class SimulatorCore:
         self.map_ticker_dir[f"{op.ticker}:{op.tipo}"] = new_id
 
         dt_utc = self._dt_utc_from_ts(ts)
+        # -------- LOG 5: Precio que se pasa a log_operaciones_simuladas --------
         self._log_evento(
             "apertura",
             op,
@@ -248,10 +276,13 @@ class SimulatorCore:
                 "comision": comision,
                 "apalancamiento": apalancamiento,
                 "mult_sl_asignado": getattr(s, "mult_sl_asignado", None),
-                "mult_tp_asignado": getattr(s, "mult_tp_asignado", None)
+                "mult_tp_asignado": getattr(s, "mult_tp_asignado", None),
+                "precio_senal": getattr(s, "precio_senal", None)
             }
         )
+        log_debug(f"[LOG_OPERACION] id_operacion={op.id_operacion} id_inversionista={self.investor.id_inversionista} precio_exec_log={precio_exec} precio_senal_log={getattr(s, 'precio_senal', None)}")
 
+    # ... resto del archivo SIN MODIFICAR ...
     def _aplicar_dca(self, op: Operation, price_record, ts: int, s):
         capital_antes = self.investor.capital_actual
         monto_base = calcular_monto_operacion(self.investor, self.risk)
