@@ -1,23 +1,38 @@
-# simulator/closures.py
-# Reglas de cierres: TP, SL, Protección, Retroceso sin avance, Parcial
-# v1.0.2 (Refactor: prioriza liquidación parcial SL antes de total SL + logging detallado a archivo)
-
-from simulator.models import Operation, Investor
-from simulator.capital import acreditar_capital
 from simulator.fees import aplicar_slippage, calcular_comision
-from simulator.utils import log_debug  # <-- Utilidad para logging a archivo
+from simulator.capital import acreditar_capital
+import logging
 
-def evaluar_cierres_reglas(op: Operation, high: float, low: float, close: float,
-                           inv: Investor, ts: int):
-    if not op.abierta or inv.halted:
-        return []
-    eventos = []
-    fr = op.strategy.to_fracciones()
+# Configuración del logger para archivo y pantalla
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler("simulador_debug.log"),
+        logging.StreamHandler()
+    ]
+)
+def log_debug(msg: str):
+    logging.info(msg)
 
-    # Take Profit (TP)
-    if (op.tipo == "LONG" and high >= op.take_profit) or \
-       (op.tipo == "SHORT" and low <= op.take_profit):
-        precio_exec = aplicar_slippage(op.take_profit, op.tipo, inv.slippage_close_pct, side="exit")
+def cerrar_operacion(op, precios, inv, ts, eventos, logger):
+    """
+    Lógica de cierres y liquidaciones para operaciones.
+    Cada bloque es independiente y el primero que cumple su condición ejecuta y retorna.
+    precios: dict con keys 'open', 'high', 'low', 'close'
+    """
+    high = precios['high']
+    low = precios['low']
+    close = precios['close']
+    entrada = op.precio_entrada
+    tp = op.take_profit
+    sl = op.stop_loss
+
+    # Detectar si la operación es una HIJA (NO permitir liquidación parcial)
+    es_hija = hasattr(op, "id_operacion_padre") and op.id_operacion_padre not in [None, 0]
+
+    # --- b1: Cierre total por TP ---
+    if (op.tipo == "LONG" and high >= tp) or (op.tipo == "SHORT" and low <= tp):
+        precio_exec = aplicar_slippage(tp, op.tipo, inv.slippage_close_pct, side="exit")
         comision = calcular_comision(precio_exec, op.cantidad, inv.commission_pct)
         pnl_net = op.cerrar_total(precio_exec, comision, ts)
         acreditar_capital(inv, op.capital_invertido + pnl_net)
@@ -31,64 +46,93 @@ def evaluar_cierres_reglas(op: Operation, high: float, low: float, close: float,
             "pnl_net": pnl_net,
             "op": op
         })
+        if logger:
+            logger.log("cierre_total", motivo="Take Profit", op=op.id_operacion, precio=precio_exec)
         return eventos
 
-    avance_minimo = op.avance_minimo_alcanzado()
-    hubo_avance = op.hubo_algun_avance()
-    sin_avance = op.sin_avance()
+    # --- b2: Cierre parcial por SL (retroceso sin avance mínimo, SOLO para posición madre y SOLO una vez) ---
+    if not es_hija and getattr(op, "permite_parcial", False) and not getattr(op, "liq_parcial_previa", False):
+        avance_minimo = (tp - entrada) * op.strategy.avance_minimo_pct / 100.0
+        porc_retroceso_liq_parcial = op.strategy.porc_retroceso_liquidacion_sl
+        porc_liq_parcial = op.strategy.porc_liquidacion_parcial_sl
 
-    # 1. Liquidación PARCIAL por SL (antes que SL total)
-    log_debug(
-        f"Evaluando parcial SL: avance_minimo={avance_minimo}, hubo_avance={hubo_avance}, "
-        f"habilitar_parcial={op.strategy.habilitar_parcial}, permite_parcial={op.permite_parcial}"
-    )
-    if (not avance_minimo) and hubo_avance and op.strategy.habilitar_parcial and op.permite_parcial:
-        retro = op.retroceso_desde_entrada(low=low, high=high)
-        log_debug(
-            f"  -> retro={retro}, retroceso_parcial={fr['retroceso_parcial']}, "
-            f"parciales_realizados={op.parciales_realizados}, max_parciales={op.strategy.max_parciales}"
-        )
-        if retro >= fr["retroceso_parcial"] and op.parciales_realizados < op.strategy.max_parciales:
-            qty_liq_estimada = op.cantidad * fr["porc_liq_parcial"]
-            log_debug(
-                f"    -> qty_liq_estimada={qty_liq_estimada}, "
-                f"porc_liq_parcial={fr['porc_liq_parcial']}, cantidad={op.cantidad}"
-            )
-            precio_exec = aplicar_slippage(close, op.tipo, inv.slippage_close_pct, side="exit")
-            comision_parcial = calcular_comision(precio_exec, qty_liq_estimada, inv.commission_pct)
-            log_debug(
-                f"    -> precio_exec={precio_exec}, comision_parcial={comision_parcial}"
-            )
-            info = op.cerrar_parcial_creando_hija(precio_exec, comision_parcial, ts)
-            log_debug(
-                f"    -> info={info}"
-            )
-            if info:
-                acreditar_capital(inv, info["capital_liq"] + info["pnl_parcial_net"])
-                inv.registrar_pnl_realizado(info["pnl_parcial_net"])
-                inv.verificar_drawdown()
-                log_debug(
-                    f"    -> Parcial ejecutado, se acredita capital_liq + pnl_parcial_net = "
-                    f"{info['capital_liq']} + {info['pnl_parcial_net']}"
-                )
-                eventos.append({
-                    "tipo_evento": "cierre_parcial",
-                    "motivo": "Liquidación parcial por SL",
-                    "precio_exec": precio_exec,
-                    "comision": comision_parcial,
-                    "retro": retro,
-                    "qty_liq": info["qty_liq"],
-                    "pnl_parcial_net": info["pnl_parcial_net"],
-                    "capital_liq": info["capital_liq"],
-                    "op_padre": op,
-                    "hija": info["hija"]
-                })
-                return eventos
+        if op.tipo == "LONG":
+            hubo_peq_avance = op.precio_max > entrada
+            no_avance_min = op.precio_max < (entrada + avance_minimo)
+            bajo_de_entrada = low < entrada
+            # El límite es ENTRADA - % de la distancia a SL
+            limite_parcial = entrada - ((entrada - sl) * porc_retroceso_liq_parcial / 100.0)
+            bajo_de_limite = low <= limite_parcial
+            retroceso_parcial = hubo_peq_avance and no_avance_min and bajo_de_entrada and bajo_de_limite
+            if low < entrada:
+                log_debug(f"[DEBUG] LIQ PARCIAL LONG - id_op={op.id_operacion}, low={low}, sl={sl}, limite_parcial={limite_parcial}, hubo_peq_avance={hubo_peq_avance}, no_avance_min={no_avance_min}, bajo_de_entrada={bajo_de_entrada}, bajo_de_limite={bajo_de_limite}, retroceso_parcial={retroceso_parcial}, precio_max={op.precio_max}, entrada={entrada}, avance_minimo={avance_minimo}, porc_liq_parcial={porc_liq_parcial}")
 
-    # 2. Stop Loss (SL) - después del parcial
-    if (op.tipo == "LONG" and low <= op.stop_loss) or \
-       (op.tipo == "SHORT" and high >= op.stop_loss):
-        precio_exec = aplicar_slippage(op.stop_loss, op.tipo, inv.slippage_close_pct, side="exit")
+            if retroceso_parcial:
+                precio_exec = aplicar_slippage(low, op.tipo, inv.slippage_close_pct, side="exit")
+                comision = calcular_comision(precio_exec, op.cantidad * porc_liq_parcial / 100.0, inv.commission_pct)
+                cerrado = op.cerrar_parcial_creando_hija(precio_exec, comision, ts)
+                if cerrado is not None:
+                    pnl_net = cerrado["pnl_parcial_net"]
+                    cantidad_parcial = cerrado["qty_liq"]
+                    hija = cerrado["hija"]
+                    # Lógica de acreditación y registro
+                    acreditar_capital(inv, (op.capital_invertido / (op.capital_invertido + hija.capital_invertido)) * cantidad_parcial + pnl_net)
+                    inv.registrar_pnl_realizado(pnl_net)
+                    eventos.append({
+                        "tipo_evento": "cierre_parcial",
+                        "motivo": "Parcial SL",
+                        "precio_exec": precio_exec,
+                        "comision": comision,
+                        "pnl_net": pnl_net,
+                        "cantidad": cantidad_parcial,
+                        "op": op,
+                        "hija": hija
+                    })
+                    if logger:
+                        logger.log("cierre_parcial", motivo="Parcial SL", op=op.id_operacion, precio=precio_exec)
+                    op.liq_parcial_previa = True
+                    return eventos
+
+        else:  # SHORT
+            hubo_peq_avance = op.precio_min < entrada
+            no_avance_min = op.precio_min > (entrada - avance_minimo)
+            sobre_de_entrada = high > entrada
+            # El límite es ENTRADA + % de la distancia a SL (al alza)
+            limite_parcial = entrada + ((sl - entrada) * porc_retroceso_liq_parcial / 100.0)
+            sobre_limite = high >= limite_parcial
+            retroceso_parcial = hubo_peq_avance and no_avance_min and sobre_de_entrada and sobre_limite
+
+            log_debug(f"[DEBUG] LIQ PARCIAL SHORT - id_op={op.id_operacion}, high={high}, sl={sl}, limite_parcial={limite_parcial}, hubo_peq_avance={hubo_peq_avance}, no_avance_min={no_avance_min}, sobre_de_entrada={sobre_de_entrada}, sobre_limite={sobre_limite}, retroceso_parcial={retroceso_parcial}, precio_min={op.precio_min}, entrada={entrada}, avance_minimo={avance_minimo}, porc_liq_parcial={porc_liq_parcial}")
+
+            if retroceso_parcial:
+                precio_exec = aplicar_slippage(high, op.tipo, inv.slippage_close_pct, side="exit")
+                comision = calcular_comision(precio_exec, op.cantidad * porc_liq_parcial / 100.0, inv.commission_pct)
+                cerrado = op.cerrar_parcial_creando_hija(precio_exec, comision, ts)
+                if cerrado is not None:
+                    pnl_net = cerrado["pnl_parcial_net"]
+                    cantidad_parcial = cerrado["qty_liq"]
+                    hija = cerrado["hija"]
+                    # Lógica de acreditación y registro
+                    acreditar_capital(inv, (op.capital_invertido / (op.capital_invertido + hija.capital_invertido)) * cantidad_parcial + pnl_net)
+                    inv.registrar_pnl_realizado(pnl_net)
+                    eventos.append({
+                        "tipo_evento": "cierre_parcial",
+                        "motivo": "Parcial SL",
+                        "precio_exec": precio_exec,
+                        "comision": comision,
+                        "pnl_net": pnl_net,
+                        "cantidad": cantidad_parcial,
+                        "op": op,
+                        "hija": hija
+                    })
+                    if logger:
+                        logger.log("cierre_parcial", motivo="Parcial SL", op=op.id_operacion, precio=precio_exec)
+                    op.liq_parcial_previa = True
+                    return eventos
+
+    # --- b3: Cierre total por SL ---
+    if (op.tipo == "LONG" and low <= sl) or (op.tipo == "SHORT" and high >= sl):
+        precio_exec = aplicar_slippage(sl, op.tipo, inv.slippage_close_pct, side="exit")
         comision = calcular_comision(precio_exec, op.cantidad, inv.commission_pct)
         pnl_net = op.cerrar_total(precio_exec, comision, ts)
         acreditar_capital(inv, op.capital_invertido + pnl_net)
@@ -102,49 +146,92 @@ def evaluar_cierres_reglas(op: Operation, high: float, low: float, close: float,
             "pnl_net": pnl_net,
             "op": op
         })
+        if logger:
+            logger.log("cierre_total", motivo="Stop Loss", op=op.id_operacion, precio=precio_exec)
         return eventos
 
-    # Protección (retroceso desde el extremo tras avance mínimo)
-    if avance_minimo and op.strategy.habilitar_proteccion_ganancias:
-        ratio_retro = op.ratio_retroceso_proteccion(low=low, high=high)
-        if ratio_retro >= fr["limite_retro_proteccion"]:
-            precio_exec = aplicar_slippage(close, op.tipo, inv.slippage_close_pct, side="exit")
+    # --- b4: Cierre total por retroceso desde entrada (sin avance significativo) ---
+    if op.tipo == "LONG":
+        if (low < entrada and op.precio_max <= entrada and low > sl and
+                low <= op.strategy.limite_liq_retroceso_entrada()):
+            precio_exec = aplicar_slippage(low, op.tipo, inv.slippage_close_pct, side="exit")
             comision = calcular_comision(precio_exec, op.cantidad, inv.commission_pct)
             pnl_net = op.cerrar_total(precio_exec, comision, ts)
             acreditar_capital(inv, op.capital_invertido + pnl_net)
             inv.registrar_pnl_realizado(pnl_net)
-            inv.verificar_drawdown()
-            motivo = "Retroceso desde máximo" if op.tipo == "LONG" else "Retroceso desde mínimo"
             eventos.append({
                 "tipo_evento": "cierre_total",
-                "motivo": motivo,
+                "motivo": "Retroceso desde entrada",
                 "precio_exec": precio_exec,
                 "comision": comision,
                 "pnl_net": pnl_net,
-                "ratio_retro": ratio_retro,
                 "op": op
             })
+            if logger:
+                logger.log("cierre_total", motivo="Retroceso desde entrada", op=op.id_operacion, precio=precio_exec)
             return eventos
-
-    # Retroceso sin avance
-    if sin_avance and op.strategy.habilitar_retroceso_sin_avance and op.permite_parcial:
-        retro = op.retroceso_desde_entrada(low=low, high=high)
-        if retro >= fr["retroceso_sin_avance"]:
-            precio_exec = aplicar_slippage(close, op.tipo, inv.slippage_close_pct, side="exit")
+    else:  # SHORT
+        if (high > entrada and op.precio_min >= entrada and high < sl and
+                high >= op.strategy.limite_liq_retroceso_entrada()):
+            precio_exec = aplicar_slippage(high, op.tipo, inv.slippage_close_pct, side="exit")
             comision = calcular_comision(precio_exec, op.cantidad, inv.commission_pct)
             pnl_net = op.cerrar_total(precio_exec, comision, ts)
             acreditar_capital(inv, op.capital_invertido + pnl_net)
             inv.registrar_pnl_realizado(pnl_net)
-            inv.verificar_drawdown()
             eventos.append({
                 "tipo_evento": "cierre_total",
-                "motivo": "Retroceso desde entrada (sin avance)",
+                "motivo": "Retroceso desde entrada",
                 "precio_exec": precio_exec,
                 "comision": comision,
                 "pnl_net": pnl_net,
-                "retro": retro,
                 "op": op
             })
+            if logger:
+                logger.log("cierre_total", motivo="Retroceso desde entrada", op=op.id_operacion, precio=precio_exec)
             return eventos
 
+    # --- b5: Cierre total por retroceso desde máximo alcanzado (tras avance mínimo) ---
+    if op.tipo == "LONG":
+        avance_minimo = (tp - entrada) * op.strategy.avance_minimo_pct / 100.0
+        limite_retroceso_precio = op.precio_max - ((op.precio_max - entrada) * op.strategy.limite_retroceso_max())
+        if (high > entrada and op.precio_max >= entrada + avance_minimo and
+                low < op.precio_max and low <= limite_retroceso_precio):
+            precio_exec = aplicar_slippage(low, op.tipo, inv.slippage_close_pct, side="exit")
+            comision = calcular_comision(precio_exec, op.cantidad, inv.commission_pct)
+            pnl_net = op.cerrar_total(precio_exec, comision, ts)
+            acreditar_capital(inv, op.capital_invertido + pnl_net)
+            inv.registrar_pnl_realizado(pnl_net)
+            eventos.append({
+                "tipo_evento": "cierre_total",
+                "motivo": "Retroceso desde máximo",
+                "precio_exec": precio_exec,
+                "comision": comision,
+                "pnl_net": pnl_net,
+                "op": op
+            })
+            if logger:
+                logger.log("cierre_total", motivo="Retroceso desde máximo", op=op.id_operacion, precio=precio_exec)
+            return eventos
+    else:  # SHORT
+        avance_minimo = (entrada - tp) * op.strategy.avance_minimo_pct / 100.0
+        if (low < entrada and op.precio_min <= entrada - avance_minimo and
+                high > op.precio_min and high >= op.strategy.limite_retroceso_max()):
+            precio_exec = aplicar_slippage(high, op.tipo, inv.slippage_close_pct, side="exit")
+            comision = calcular_comision(precio_exec, op.cantidad, inv.commission_pct)
+            pnl_net = op.cerrar_total(precio_exec, comision, ts)
+            acreditar_capital(inv, op.capital_invertido + pnl_net)
+            inv.registrar_pnl_realizado(pnl_net)
+            eventos.append({
+                "tipo_evento": "cierre_total",
+                "motivo": "Retroceso desde máximo",
+                "precio_exec": precio_exec,
+                "comision": comision,
+                "pnl_net": pnl_net,
+                "op": op
+            })
+            if logger:
+                logger.log("cierre_total", motivo="Retroceso desde máximo", op=op.id_operacion, precio=precio_exec)
+            return eventos
+
+    # Si ninguna condición se cumple, no se cierra nada
     return eventos
