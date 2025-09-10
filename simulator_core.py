@@ -32,7 +32,7 @@ from simulator.validations import (
 )
 from simulator.fees import calcular_comision
 from simulator.dca import aplicar_dca
-from simulator.closures import evaluar_cierres_reglas
+from simulator.closures import cerrar_operacion
 from simulator.finalization import finalizar_simulacion
 from simulator.utils_time import minute_to_datetime
 
@@ -206,7 +206,6 @@ class SimulatorCore:
                 "total_debitar": total_debitar
             }, ts=ts)
             return
-
         # Estrategia
         try:
             sp: StrategyParams = self.strategy_cache.get(s.id_estrategia_fk)
@@ -282,7 +281,6 @@ class SimulatorCore:
         )
         log_debug(f"[LOG_OPERACION] id_operacion={op.id_operacion} id_inversionista={self.investor.id_inversionista} precio_exec_log={precio_exec} precio_senal_log={getattr(s, 'precio_senal', None)}")
 
-    # ... resto del archivo SIN MODIFICAR ...
     def _aplicar_dca(self, op: Operation, price_record, ts: int, s):
         capital_antes = self.investor.capital_actual
         monto_base = calcular_monto_operacion(self.investor, self.risk)
@@ -333,12 +331,13 @@ class SimulatorCore:
             op.actualizar_extremos(price_record.high, price_record.low)
             capital_antes = self.investor.capital_actual
 
-            eventos = evaluar_cierres_reglas(op,
-                                             high=price_record.high,
-                                             low=price_record.low,
-                                             close=price_record.close,
-                                             inv=self.investor,
-                                             ts=ts)
+            precios = {
+                "open": price_record.open,
+                "high": price_record.high,
+                "low": price_record.low,
+                "close": price_record.close
+            }
+            eventos = cerrar_operacion(op, precios, self.investor, ts, [], self.logger)
             if not eventos:
                 continue
 
@@ -414,7 +413,6 @@ class SimulatorCore:
                 return
             if self.investor.desincronizado:
                 return
-
     def run(self, ts_inicio: int, ts_fin: int):
         for ts in range(ts_inicio, ts_fin + 1):
             if self.investor.halted or self.investor.desincronizado:
@@ -504,4 +502,4 @@ class SimulatorCore:
             except Exception as e:
                 self._marcar_error_persistencia(e, "finalizar_snapshot")
             return pyg
-        return None
+        return None				
