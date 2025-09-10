@@ -37,6 +37,19 @@ class StrategyParams:
             "retroceso_sin_avance": self.porc_limite_retro_entrada / 100.0
         }
 
+    def limite_retroceso_liq_parcial_SL(self):
+        return self.porc_liquidacion_parcial_sl / 100.0
+
+    def limite_liq_retroceso_entrada(self):
+        return self.porc_limite_retro_entrada / 100.0
+
+    def limite_retroceso_max(self):
+        return self.porc_limite_retro / 100.0
+
+    @property
+    def umbral_avance_minimo(self):
+        return self.avance_minimo_pct / 100.0
+    
 @dataclass
 class Investor:
     id_inversionista: int
@@ -235,3 +248,4 @@ class Operation:
     @property
     def valor_total_exposicion(self) -> float:
         return self.cantidad * self.precio_entrada
+    
